@@ -1,3 +1,5 @@
+
+
 """
 =============================================================
   BOOM & CRASH SIGNAL BOT  —  ADAPTIVE EDITION
@@ -12,6 +14,11 @@
     4. Loss Memory / Auto-Pause  — pauses market after 3 losses
     5. Dynamic ATR Multiplier    — widens/tightens SL & TP with volatility
 
+  DATA SOURCE:
+    Live data via official Deriv WebSocket API (derivws.com)
+    - tick streaming for live price
+    - candle history for indicator calculations
+
   Delivery: Telegram signals + warnings + daily summary
 =============================================================
 
@@ -20,6 +27,11 @@ SETUP
 pip install pandas numpy pandas-ta requests websockets python-dotenv
 Rename .env.example → .env and fill in your values.
 Run: python boom_crash_bot.py
+
+TELEGRAM COMMANDS (send in your Telegram chat):
+  /win Crash 1000   — record a win, resets loss streak
+  /loss Boom 500    — record a loss, triggers auto-pause if 3 in a row
+  /status           — view all 6 markets live state
 =============================================================
 """
 
@@ -44,6 +56,16 @@ DERIV_APP_ID = os.getenv("DERIV_APP_ID")
 
 CHECK_INTERVAL = 300    # scan every 5 minutes
 COOLDOWN = 1800   # 30 min between signals per market
+
+# ─────────────────────────────────────────────────────────────
+#  DERIV WEBSOCKET URL  (corrected from user-supplied snippet)
+#  Format: wss://derivws.com/websockets/v3?app_id=YOUR_APP_ID
+# ─────────────────────────────────────────────────────────────
+
+
+def deriv_ws_url(app_id: str) -> str:
+    return f"wss://derivws.com/websockets/v3?app_id={app_id}"
+
 
 # ─────────────────────────────────────────────────────────────
 #  MARKETS
@@ -78,35 +100,16 @@ BASE_SETTINGS = {
 # ─────────────────────────────────────────────────────────────
 #  ADAPTIVE FILTER SETTINGS
 # ─────────────────────────────────────────────────────────────
-
-# 1. VOLATILITY REGIME
-#    ATR must be within this multiplier range of its own 50-period average.
-#    Below MIN = too quiet/dead market. Above MAX = too chaotic/news spike.
-ATR_REGIME_MIN = 0.5   # ATR must be at least 50% of its average
-ATR_REGIME_MAX = 2.8   # ATR must not exceed 280% of its average
-
-# 2. ADX TREND STRENGTH
-#    ADX below MIN = market is choppy/sideways, skip signal.
-#    ADX above MAX = trend may be overextended, reduce confidence.
-ADX_MIN = 20           # minimum trend strength to trade
-ADX_MAX = 60           # above this = overextended, still trade but warn
-
-# 3. SESSION FILTER (UTC hours)
-#    Boom/Crash most reliable during these UTC hour windows.
-#    Outside these windows signals fire but are marked as lower quality.
-GOOD_SESSIONS = [(6, 12), (13, 18), (20, 23)]  # UTC hour ranges
-
-# 4. LOSS MEMORY
-#    If a market fires this many consecutive losses, pause it temporarily.
+ATR_REGIME_MIN = 0.5    # below = dead/flat market
+ATR_REGIME_MAX = 2.8    # above = chaotic, block signals
+ADX_MIN = 20     # below = choppy, skip
+ADX_MAX = 60     # above = overextended, warn
+GOOD_SESSIONS = [(6, 12), (13, 18), (20, 23)]  # UTC hours
 MAX_CONSECUTIVE_LOSSES = 3
-LOSS_PAUSE_MINUTES = 120   # pause for 2 hours after max losses hit
-
-# 5. DYNAMIC ATR MULTIPLIER
-#    In high volatility: widen SL/TP. In low volatility: tighten them.
-#    Multiplier is applied ON TOP of the base ATR settings.
-DYNAMIC_ATR_HIGH_VOL = 1.3    # widen by 30% in high volatility
-DYNAMIC_ATR_LOW_VOL = 0.85   # tighten by 15% in low volatility
-DYNAMIC_ATR_NORMAL = 1.0    # no change in normal volatility
+LOSS_PAUSE_MINUTES = 120
+DYNAMIC_ATR_HIGH_VOL = 1.3
+DYNAMIC_ATR_LOW_VOL = 0.85
+DYNAMIC_ATR_NORMAL = 1.0
 
 # ─────────────────────────────────────────────────────────────
 #  STATE TRACKING
@@ -121,7 +124,7 @@ market_state = {
         "daily_buy": 0,
         "daily_sell": 0,
         "daily_signals": 0,
-        "regime": "NORMAL",   # NORMAL / HIGH_VOL / LOW_VOL / CHAOTIC
+        "regime": "NORMAL",
     }
     for name in MARKETS
 }
@@ -139,35 +142,98 @@ def send_telegram(message: str):
         if r.status_code != 200:
             print(f"[Telegram] Failed: {r.text}")
         else:
-            print(f"[Telegram] Sent ✅")
+            print("[Telegram] Sent ✅")
     except Exception as e:
         print(f"[Telegram] Error: {e}")
 
 
 # ─────────────────────────────────────────────────────────────
-#  DATA FETCHER
+#  LIVE TICK STREAM  (from user-supplied pattern)
+#  Used to get the latest real-time price for a symbol.
 # ─────────────────────────────────────────────────────────────
-async def fetch_candles(symbol: str, granularity: int, count: int) -> pd.DataFrame:
-    url = f"wss://ws.binaryws.com/websockets/v3?app_id={DERIV_APP_ID}"
-    req = {
-        "ticks_history": symbol, "adjust_start_time": 1,
-        "count": count, "end": "latest",
-        "granularity": granularity, "style": "candles",
+async def get_latest_tick(symbol: str) -> float | None:
+    """
+    Connect to Deriv WebSocket, subscribe to live ticks,
+    grab the first tick price, then disconnect.
+    Returns the latest quoted price or None on error.
+    """
+    uri = deriv_ws_url(DERIV_APP_ID)
+    request = {
+        "ticks": symbol,
+        "subscribe": 1,
     }
     try:
-        async with websockets.connect(url) as ws:
-            await ws.send(json.dumps(req))
-            resp = json.loads(await ws.recv())
-        if "candles" not in resp:
-            return pd.DataFrame()
-        df = pd.DataFrame(resp["candles"])
-        df.rename(columns={"epoch": "time"}, inplace=True)
-        df["time"] = pd.to_datetime(df["time"], unit="s")
-        for col in ["open", "high", "low", "close"]:
-            df[col] = df[col].astype(float)
-        return df.reset_index(drop=True)
+        async with websockets.connect(uri) as websocket:
+            await websocket.send(json.dumps(request))
+            # Wait for first tick response
+            while True:
+                response = await asyncio.wait_for(websocket.recv(), timeout=10)
+                data = json.loads(response)
+
+                if data.get("msg_type") == "tick":
+                    tick = data["tick"]
+                    print(f"  Live tick — {tick['symbol']}: {tick['quote']}")
+                    return float(tick["quote"])
+
+                elif "error" in data:
+                    print(
+                        f"  Tick error for {symbol}: {data['error']['message']}")
+                    return None
+
+    except asyncio.TimeoutError:
+        print(f"  Tick timeout for {symbol}")
+        return None
     except Exception as e:
-        print(f"  [API] {symbol} ({granularity}s): {e}")
+        print(f"  Tick stream error for {symbol}: {e}")
+        return None
+
+
+# ─────────────────────────────────────────────────────────────
+#  CANDLE HISTORY FETCHER
+#  Used to pull OHLCV history for indicator calculations.
+# ─────────────────────────────────────────────────────────────
+async def fetch_candles(symbol: str, granularity: int, count: int) -> pd.DataFrame:
+    """
+    Fetch historical OHLCV candles via Deriv WebSocket.
+    granularity: 300  = 5  minute candles
+                 1800 = 30 minute candles
+    """
+    uri = deriv_ws_url(DERIV_APP_ID)
+    request = {
+        "ticks_history": symbol,
+        "adjust_start_time": 1,
+        "count": count,
+        "end": "latest",
+        "granularity": granularity,
+        "style": "candles",
+    }
+    try:
+        async with websockets.connect(uri) as ws:
+            await ws.send(json.dumps(request))
+
+            # Keep reading until we get candles or an error
+            while True:
+                response = await asyncio.wait_for(ws.recv(), timeout=15)
+                data = json.loads(response)
+
+                if "candles" in data:
+                    df = pd.DataFrame(data["candles"])
+                    df.rename(columns={"epoch": "time"}, inplace=True)
+                    df["time"] = pd.to_datetime(df["time"], unit="s")
+                    for col in ["open", "high", "low", "close"]:
+                        df[col] = df[col].astype(float)
+                    return df.reset_index(drop=True)
+
+                elif "error" in data:
+                    print(f"  Candle error {symbol} ({granularity}s): "
+                          f"{data['error']['message']}")
+                    return pd.DataFrame()
+
+    except asyncio.TimeoutError:
+        print(f"  Candle timeout {symbol} ({granularity}s)")
+        return pd.DataFrame()
+    except Exception as e:
+        print(f"  Candle fetch error {symbol}: {e}")
         return pd.DataFrame()
 
 
@@ -177,7 +243,7 @@ async def fetch_candles(symbol: str, granularity: int, count: int) -> pd.DataFra
 def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     c, h, l = df["close"], df["high"], df["low"]
 
-    # EMAs
+    # EMA Ribbon
     df["ema20"] = ta.ema(c, length=20)
     df["ema50"] = ta.ema(c, length=50)
     df["ema100"] = ta.ema(c, length=100)
@@ -190,9 +256,8 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df["bb_mid"] = bb["BBM_20_2.0"]
     df["bb_width"] = (df["bb_upper"] - df["bb_lower"]) / df["bb_mid"]
 
-    # ATR
+    # ATR (50-period average for regime detection)
     df["atr"] = ta.atr(h, l, c, length=14)
-    # 50-period for regime detection
     df["atr_ma"] = df["atr"].rolling(50).mean()
 
     # RSI
@@ -209,11 +274,11 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df["stoch_k"] = stoch["STOCHk_5_3_3"]
     df["stoch_d"] = stoch["STOCHd_5_3_3"]
 
-    # ADX — trend strength (key adaptive filter)
+    # ADX (trend strength — key adaptive filter)
     adx = ta.adx(h, l, c, length=14)
     df["adx"] = adx["ADX_14"]
-    df["dmp"] = adx["DMP_14"]   # +DI
-    df["dmn"] = adx["DMN_14"]   # -DI
+    df["dmp"] = adx["DMP_14"]   # +DI bullish
+    df["dmn"] = adx["DMN_14"]   # -DI bearish
 
     return df
 
@@ -222,11 +287,6 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
 #  ADAPTIVE FILTER 1 — VOLATILITY REGIME
 # ─────────────────────────────────────────────────────────────
 def get_volatility_regime(df: pd.DataFrame) -> tuple[str, float]:
-    """
-    Returns (regime, dynamic_multiplier).
-    Regime: NORMAL / HIGH_VOL / LOW_VOL / CHAOTIC
-    Multiplier adjusts SL & TP distances dynamically.
-    """
     last = df.iloc[-1]
     atr = last["atr"]
     atr_ma = last["atr_ma"]
@@ -237,40 +297,34 @@ def get_volatility_regime(df: pd.DataFrame) -> tuple[str, float]:
     ratio = atr / atr_ma
 
     if ratio > ATR_REGIME_MAX:
-        return "CHAOTIC", DYNAMIC_ATR_HIGH_VOL     # too wild — block signal
+        return "CHAOTIC",  DYNAMIC_ATR_HIGH_VOL
     elif ratio > 1.5:
-        return "HIGH_VOL", DYNAMIC_ATR_HIGH_VOL    # widen SL/TP
+        return "HIGH_VOL", DYNAMIC_ATR_HIGH_VOL
     elif ratio < ATR_REGIME_MIN:
-        return "LOW_VOL", DYNAMIC_ATR_LOW_VOL      # dead market — tighten
+        return "LOW_VOL",  DYNAMIC_ATR_LOW_VOL
     else:
-        return "NORMAL", DYNAMIC_ATR_NORMAL
+        return "NORMAL",   DYNAMIC_ATR_NORMAL
 
 
 # ─────────────────────────────────────────────────────────────
 #  ADAPTIVE FILTER 2 — ADX TREND STRENGTH
 # ─────────────────────────────────────────────────────────────
 def check_adx(df: pd.DataFrame, bias: str) -> tuple[bool, float, str]:
-    """
-    Returns (passes, adx_value, reason).
-    Checks ADX strength AND directional alignment (+DI / -DI).
-    """
     last = df.iloc[-1]
     adx = last["adx"]
-    dmp = last["dmp"]   # +DI = bullish pressure
-    dmn = last["dmn"]   # -DI = bearish pressure
+    dmp = last["dmp"]
+    dmn = last["dmn"]
 
     if pd.isna(adx):
-        return True, 0.0, "ADX unavailable — skipping filter"
+        return True, 0.0, "ADX unavailable"
 
-    # Too weak — choppy market
     if adx < ADX_MIN:
-        return False, adx, f"ADX {adx:.1f} < {ADX_MIN} — market is choppy/sideways"
+        return False, adx, f"ADX {adx:.1f} < {ADX_MIN} — choppy market"
 
-    # Directional alignment check
     if bias == "BUY" and dmp < dmn:
-        return False, adx, f"ADX bullish signal but -DI ({dmn:.1f}) > +DI ({dmp:.1f}) — direction mismatch"
+        return False, adx, f"BUY signal but -DI({dmn:.1f}) > +DI({dmp:.1f})"
     if bias == "SELL" and dmn < dmp:
-        return False, adx, f"ADX bearish signal but +DI ({dmp:.1f}) > -DI ({dmn:.1f}) — direction mismatch"
+        return False, adx, f"SELL signal but +DI({dmp:.1f}) > -DI({dmn:.1f})"
 
     return True, adx, "OK"
 
@@ -279,55 +333,47 @@ def check_adx(df: pd.DataFrame, bias: str) -> tuple[bool, float, str]:
 #  ADAPTIVE FILTER 3 — SESSION QUALITY
 # ─────────────────────────────────────────────────────────────
 def check_session() -> tuple[bool, str]:
-    """
-    Returns (is_good_session, session_note).
-    Boom/Crash synthetic indices trade 24/7 but quality varies.
-    """
     hour = datetime.now(timezone.utc).hour
     for start, end in GOOD_SESSIONS:
         if start <= hour < end:
-            return True, f"Session UTC {start:02d}:00–{end:02d}:00 ✅"
-    return False, f"Off-peak session (UTC {hour:02d}:xx) — signal quality lower ⚠️"
+            return True, f"Peak session UTC {start:02d}:00–{end:02d}:00 ✅"
+    return False, f"Off-peak UTC {hour:02d}:xx ⚠️"
 
 
 # ─────────────────────────────────────────────────────────────
-#  ADAPTIVE FILTER 4 — LOSS MEMORY / AUTO-PAUSE
+#  ADAPTIVE FILTER 4 — LOSS MEMORY
 # ─────────────────────────────────────────────────────────────
 def is_market_paused(name: str) -> tuple[bool, str]:
-    """Check if market is in auto-pause due to consecutive losses."""
-    state = market_state[name]
+    s = market_state[name]
     now = time.time()
-    if state["pause_until"] > now:
-        mins_left = int((state["pause_until"] - now) / 60)
-        return True, f"Auto-paused ({mins_left}m remaining) — {state['paused_reason']}"
+    if s["pause_until"] > now:
+        mins = int((s["pause_until"] - now) / 60)
+        return True, f"Auto-paused {mins}m remaining — {s['paused_reason']}"
     return False, ""
 
 
 def record_loss(name: str):
-    """Call this when a signal is confirmed as a loss (manual or future auto-tracking)."""
-    state = market_state[name]
-    state["consecutive_losses"] += 1
-    if state["consecutive_losses"] >= MAX_CONSECUTIVE_LOSSES:
-        pause_until = time.time() + (LOSS_PAUSE_MINUTES * 60)
-        reason = f"{MAX_CONSECUTIVE_LOSSES} consecutive losses detected"
-        state["pause_until"] = pause_until
-        state["paused_reason"] = reason
-        state["consecutive_losses"] = 0
+    s = market_state[name]
+    s["consecutive_losses"] += 1
+    if s["consecutive_losses"] >= MAX_CONSECUTIVE_LOSSES:
+        reason = f"{MAX_CONSECUTIVE_LOSSES} consecutive losses"
+        s["pause_until"] = time.time() + (LOSS_PAUSE_MINUTES * 60)
+        s["paused_reason"] = reason
+        s["consecutive_losses"] = 0
         send_telegram(
             f"⏸ <b>{name} AUTO-PAUSED</b>\n\n"
             f"Reason: {reason}\n"
             f"Resuming in {LOSS_PAUSE_MINUTES} minutes.\n\n"
-            f"<i>The bot detected a rough patch and is protecting your account.</i>"
+            f"<i>Bot is protecting your account during a rough patch.</i>"
         )
 
 
 def record_win(name: str):
-    """Reset consecutive loss counter on a win."""
     market_state[name]["consecutive_losses"] = 0
 
 
 # ─────────────────────────────────────────────────────────────
-#  LAYER 1 — 30M BIAS CHECK
+#  LAYER 1 — 30M BIAS
 # ─────────────────────────────────────────────────────────────
 def check_bias(df30: pd.DataFrame) -> str | None:
     df30 = add_indicators(df30)
@@ -341,34 +387,27 @@ def check_bias(df30: pd.DataFrame) -> str | None:
 
 
 # ─────────────────────────────────────────────────────────────
-#  LAYERS 2+3 — 5M COMPRESSION + ENTRY
+#  LAYERS 2+3 — 5M COMPRESSION + ENTRY TIMING
 # ─────────────────────────────────────────────────────────────
-def check_entry(df5: pd.DataFrame, bias: str, freq: int,
-                dyn_mult: float) -> dict | None:
-    """
-    Checks BB squeeze + ATR compression (Layer 2)
-    then RSI / MACD / Stochastic timing (Layer 3).
-    Uses dynamic multiplier from volatility regime for SL/TP.
-    """
-    df5 = add_indicators(df5)
+def check_entry(df5: pd.DataFrame, bias: str,
+                freq: int, dyn_mult: float) -> dict | None:
     last = df5.iloc[-1]
     prev = df5.iloc[-2]
     cfg = BASE_SETTINGS[freq]
 
-    # Layer 2 — compression
+    # Layer 2 — BB squeeze + ATR compression
     recent_bw = df5["bb_width"].dropna().tail(50)
     bb_squeeze = last["bb_width"] <= np.percentile(recent_bw, 20)
     atr_low = last["atr"] < last["atr_ma"]
     if not (bb_squeeze and atr_low):
         return None
 
-    # Layer 3 — entry
+    # Layer 3 — entry timing
     rsi = last["rsi"]
     stoch_k = last["stoch_k"]
     prev_k = prev["stoch_k"]
-    prev_h = prev["macd_h"]
     macd_ok = ((last["macd"] > last["macd_sig"])
-               or (last["macd_h"] > 0 and last["macd_h"] > prev_h))
+               or (last["macd_h"] > 0 and last["macd_h"] > prev["macd_h"]))
 
     if bias == "BUY":
         rsi_ok = cfg["rsi_buy_low"] <= rsi <= cfg["rsi_buy_high"]
@@ -377,11 +416,8 @@ def check_entry(df5: pd.DataFrame, bias: str, freq: int,
         if score < 2:
             return None
         entry = last["close"]
-        # Dynamic SL & TP
-        sl_dist = last["atr"] * cfg["atr_sl"] * dyn_mult
-        tp_dist = last["atr"] * cfg["atr_tp"] * dyn_mult
-        sl = round(entry - sl_dist, 5)
-        tp = round(entry + tp_dist, 5)
+        sl = round(entry - last["atr"] * cfg["atr_sl"] * dyn_mult, 5)
+        tp = round(entry + last["atr"] * cfg["atr_tp"] * dyn_mult, 5)
 
     elif bias == "SELL":
         rsi_ok = cfg["rsi_sell_low"] <= rsi <= cfg["rsi_sell_high"]
@@ -391,10 +427,8 @@ def check_entry(df5: pd.DataFrame, bias: str, freq: int,
         if score < 2:
             return None
         entry = last["close"]
-        sl_dist = last["atr"] * cfg["atr_sl"] * dyn_mult
-        tp_dist = last["atr"] * cfg["atr_tp"] * dyn_mult
-        sl = round(entry + sl_dist, 5)
-        tp = round(entry - tp_dist, 5)
+        sl = round(entry + last["atr"] * cfg["atr_sl"] * dyn_mult, 5)
+        tp = round(entry - last["atr"] * cfg["atr_tp"] * dyn_mult, 5)
     else:
         return None
 
@@ -407,7 +441,7 @@ def check_entry(df5: pd.DataFrame, bias: str, freq: int,
         "rsi": round(rsi, 2),
         "macd": round(last["macd"], 5),
         "stoch_k": round(stoch_k, 2),
-        "adx": round(last["adx"], 1) if not pd.isna(last["adx"]) else 0,
+        "adx": round(last["adx"], 1) if not pd.isna(last["adx"]) else 0.0,
         "score": score,
         "dyn_mult": dyn_mult,
     }
@@ -417,10 +451,9 @@ def check_entry(df5: pd.DataFrame, bias: str, freq: int,
 #  SIGNAL FORMATTER
 # ─────────────────────────────────────────────────────────────
 EMOJI = {
-    "Boom 300": "📈", "Boom 500": "📈", "Boom 1000": "📈",
+    "Boom 300": "📈",  "Boom 500": "📈",  "Boom 1000": "📈",
     "Crash 300": "📉", "Crash 500": "📉", "Crash 1000": "📉",
 }
-
 REGIME_LABELS = {
     "NORMAL": "🟢 Normal",
     "HIGH_VOL": "🟡 High Volatility",
@@ -437,13 +470,11 @@ def format_signal(name: str, sig: dict, freq: int,
     arrow = "🟢 BUY  ▲" if sig["direction"] == "BUY" else "🔴 SELL ▼"
     stars = "⭐" * sig["score"]
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-    vol_lbl = REGIME_LABELS.get(regime, regime)
 
-    # Dynamic SL/TP note
     if sig["dyn_mult"] > 1.0:
-        dyn_note = f"⬆️ SL/TP widened {int((sig['dyn_mult']-1)*100)}% (high vol)"
+        dyn_note = f"⬆️ SL/TP widened {int((sig['dyn_mult']-1)*100)}% — high vol"
     elif sig["dyn_mult"] < 1.0:
-        dyn_note = f"⬇️ SL/TP tightened {int((1-sig['dyn_mult'])*100)}% (low vol)"
+        dyn_note = f"⬇️ SL/TP tightened {int((1-sig['dyn_mult'])*100)}% — low vol"
     else:
         dyn_note = "➡️ SL/TP standard"
 
@@ -464,13 +495,13 @@ def format_signal(name: str, sig: dict, freq: int,
         f"Stoch  {sig['stoch_k']}\n"
         f"ADX    {sig['adx']}\n\n"
         f"┄┄┄┄ Market Conditions ┄┄┄┄\n"
-        f"Regime    {vol_lbl}\n"
-        f"Session   {session_note}\n"
+        f"Regime   {REGIME_LABELS.get(regime, regime)}\n"
+        f"Session  {session_note}\n"
         f"{dyn_note}\n\n"
         f"Confluence  {stars} ({sig['score']}/3)\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"⚠️ <i>Max 1-2% risk per trade.</i>\n"
-        f"<i>Reply /win or /loss to track results.</i>"
+        f"<i>Reply /win {name} or /loss {name} to track result.</i>"
     )
 
 
@@ -494,10 +525,10 @@ def format_summary() -> str:
     lines += [
         "",
         "━━━━━━━━━━━━━━━━━━━━━━━",
-        "💡 <b>Tips for tomorrow:</b>",
+        "💡 <b>Tomorrow tips:</b>",
         "• Only act on 3/3 confluence signals",
-        "• Skip signals during off-peak sessions",
-        "• Trust the auto-pause — it protects your account",
+        "• Skip off-peak session signals",
+        "• Trust the auto-pause",
         "<i>Stats reset for new day.</i>",
     ]
     return "\n".join(lines)
@@ -511,55 +542,67 @@ def reset_daily_stats():
 
 
 # ─────────────────────────────────────────────────────────────
-#  TELEGRAM COMMAND HANDLER (win/loss tracking)
-#  In a full deployment this would use a webhook.
-#  For simplicity, this polls for updates every cycle.
+#  TELEGRAM COMMAND POLLING  (/win /loss /status)
 # ─────────────────────────────────────────────────────────────
 last_update_id = 0
 
 
 def poll_telegram_commands():
-    """Check for /win or /loss replies from the user."""
     global last_update_id
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates"
     try:
         r = requests.get(
-            url, params={"offset": last_update_id + 1, "timeout": 2}, timeout=5)
+            url,
+            params={"offset": last_update_id + 1, "timeout": 2},
+            timeout=5
+        )
         if r.status_code != 200:
             return
-        updates = r.json().get("result", [])
-        for upd in updates:
+        for upd in r.json().get("result", []):
             last_update_id = upd["update_id"]
-            text = upd.get("message", {}).get("text", "").strip().lower()
-            if text.startswith("/win"):
-                parts = text.split()
-                mkt = " ".join(parts[1:]).title() if len(parts) > 1 else None
-                if mkt and mkt in market_state:
+            text = upd.get("message", {}).get("text", "").strip()
+
+            if text.lower().startswith("/win"):
+                parts = text.split(maxsplit=1)
+                mkt = parts[1].title() if len(parts) > 1 else ""
+                if mkt in market_state:
                     record_win(mkt)
                     send_telegram(
-                        f"✅ Win recorded for <b>{mkt}</b>. Streak reset.")
+                        f"✅ Win recorded for <b>{mkt}</b>. Loss streak reset.")
                 else:
                     send_telegram(
-                        "Usage: /win Crash 1000\nMarkets: Boom/Crash 300, 500, 1000")
-            elif text.startswith("/loss"):
-                parts = text.split()
-                mkt = " ".join(parts[1:]).title() if len(parts) > 1 else None
-                if mkt and mkt in market_state:
+                        "Usage: /win Crash 1000\n"
+                        "Markets: Boom 300, Boom 500, Boom 1000, "
+                        "Crash 300, Crash 500, Crash 1000"
+                    )
+
+            elif text.lower().startswith("/loss"):
+                parts = text.split(maxsplit=1)
+                mkt = parts[1].title() if len(parts) > 1 else ""
+                if mkt in market_state:
                     record_loss(mkt)
                     send_telegram(f"🔴 Loss recorded for <b>{mkt}</b>.")
                 else:
                     send_telegram(
-                        "Usage: /loss Crash 1000\nMarkets: Boom/Crash 300, 500, 1000")
-            elif text == "/status":
+                        "Usage: /loss Crash 500\n"
+                        "Markets: Boom 300, Boom 500, Boom 1000, "
+                        "Crash 300, Crash 500, Crash 1000"
+                    )
+
+            elif text.lower() == "/status":
                 lines = ["📊 <b>Bot Status</b>\n"]
                 for name, s in market_state.items():
                     paused, reason = is_market_paused(name)
                     regime = s.get("regime", "NORMAL")
-                    status = f"⏸ PAUSED — {reason}" if paused else f"✅ Active | {REGIME_LABELS.get(regime, regime)}"
+                    if paused:
+                        status = f"⏸ PAUSED — {reason}"
+                    else:
+                        status = f"✅ Active | {REGIME_LABELS.get(regime, regime)}"
                     lines.append(f"{EMOJI.get(name, '📊')} {name}: {status}")
                 send_telegram("\n".join(lines))
+
     except Exception:
-        pass
+        pass   # silently skip command poll errors
 
 
 # ─────────────────────────────────────────────────────────────
@@ -569,7 +612,8 @@ async def run_bot():
     print("=" * 60)
     print("  BOOM & CRASH SIGNAL BOT — ADAPTIVE EDITION")
     print("  Boom 300/500/1000  |  Crash 300/500/1000")
-    print("  Filters: Volatility Regime + ADX + Session + Loss Memory")
+    print("  Connection: wss://derivws.com (live ticks + candle history)")
+    print("  Filters: Volatility + ADX + Session + Loss Memory")
     print("=" * 60)
 
     last_summary = 0
@@ -578,9 +622,10 @@ async def run_bot():
         "🤖 <b>Boom &amp; Crash Signal Bot — ADAPTIVE EDITION</b>\n\n"
         "📈 Boom 300 | Boom 500 | Boom 1000\n"
         "📉 Crash 300 | Crash 500 | Crash 1000\n\n"
+        "🔌 Connected via: <code>wss://derivws.com</code>\n\n"
         "🧠 <b>Smart Filters Active:</b>\n"
         "  • Volatility Regime Detection\n"
-        "  • ADX Trend Strength Filter\n"
+        "  • ADX Trend Strength Check\n"
         "  • Session Quality Filter\n"
         "  • Loss Memory Auto-Pause\n"
         "  • Dynamic SL/TP Adjustment\n\n"
@@ -595,10 +640,10 @@ async def run_bot():
     while True:
         now_ts = time.time()
 
-        # Poll for /win /loss /status commands
+        # Poll Telegram for /win /loss /status commands
         poll_telegram_commands()
 
-        # Daily summary + reset
+        # Send daily summary and reset stats at midnight UTC
         if now_ts - last_summary >= 86400:
             send_telegram(format_summary())
             reset_daily_stats()
@@ -613,7 +658,7 @@ async def run_bot():
             state = market_state[name]
 
             try:
-                # ── Cooldown ─────────────────────────────
+                # ── Cooldown ──────────────────────────────
                 if now_ts - state["last_signal_time"] < COOLDOWN:
                     mins = int(
                         (COOLDOWN - (now_ts - state["last_signal_time"])) / 60)
@@ -626,60 +671,69 @@ async def run_bot():
                     print(f"  {name}: {pause_reason}")
                     continue
 
-                print(f"  {name}: fetching data...")
-
-                # ── Fetch candles ─────────────────────────
-                df5 = await fetch_candles(symbol, 300,  100)
-                df30 = await fetch_candles(symbol, 1800, 60)
-                if df5.empty or df30.empty or len(df5) < 60 or len(df30) < 30:
-                    print(f"  {name}: insufficient data")
+                # ── Get live tick price ───────────────────
+                live_price = await get_latest_tick(symbol)
+                if live_price is None:
+                    print(f"  {name}: could not get live tick, skipping")
                     continue
 
-                # Add indicators to 5M for adaptive checks
+                # ── Fetch candle history ──────────────────
+                print(f"  {name}: fetching candles...")
+                df5 = await fetch_candles(symbol, granularity=300,  count=100)
+                df30 = await fetch_candles(symbol, granularity=1800, count=60)
+
+                if df5.empty or df30.empty or len(df5) < 60 or len(df30) < 30:
+                    print(f"  {name}: insufficient candle data")
+                    continue
+
+                # Patch the last candle close with the live tick price
+                # so indicators use the most up-to-date price
+                df5.at[df5.index[-1], "close"] = live_price
+
+                # Add indicators
                 df5_ind = add_indicators(df5.copy())
 
                 # ── Filter 1: Volatility Regime ───────────
                 regime, dyn_mult = get_volatility_regime(df5_ind)
                 state["regime"] = regime
                 if regime == "CHAOTIC":
-                    print(f"  {name}: CHAOTIC market — skipping")
+                    print(f"  {name}: CHAOTIC — skipping")
                     continue
 
-                # ── Filter 2: ADX Trend Strength ──────────
-                # Need bias first for directional ADX check
+                # ── Filter 2: 30M Bias ────────────────────
                 bias = check_bias(df30)
                 if not bias:
-                    print(f"  {name}: no 30M bias")
+                    print(f"  {name}: no clear 30M bias")
                     continue
 
+                # ── Filter 3: ADX Strength ────────────────
                 adx_ok, adx_val, adx_reason = check_adx(df5_ind, bias)
                 if not adx_ok:
-                    print(f"  {name}: ADX fail — {adx_reason}")
+                    print(f"  {name}: ADX — {adx_reason}")
                     continue
 
-                # ── Filter 3: Session Quality ──────────────
+                # ── Filter 4: Session Quality ─────────────
                 good_session, session_note = check_session()
-                # Off-peak sessions: still scan but require 3/3 confluence
                 min_score = 2 if good_session else 3
 
-                print(f"  {name}: bias={bias} | regime={regime} | "
-                      f"ADX={adx_val:.1f} | session={'✅' if good_session else '⚠️'}")
+                print(f"  {name}: bias={bias} | price={live_price} | "
+                      f"regime={regime} | ADX={adx_val:.1f} | "
+                      f"session={'peak' if good_session else 'off-peak'}")
 
-                # ── Layers 2+3: Entry signal ───────────────
+                # ── Layers 2+3: Entry signal ──────────────
                 sig = check_entry(df5_ind, bias, freq, dyn_mult)
                 if not sig:
-                    print(f"  {name}: 5M entry not ready")
+                    print(f"  {name}: 5M entry conditions not met")
                     continue
 
-                # Apply session-based minimum score
                 if sig["score"] < min_score:
-                    print(f"  {name}: score {sig['score']}/{min_score} needed "
-                          f"({'off-peak' if not good_session else 'standard'})")
+                    print(f"  {name}: score {sig['score']} < "
+                          f"{min_score} required ({'off-peak' if not good_session else 'standard'})")
                     continue
 
-                # ── Signal fires! ──────────────────────────
+                # ── Signal fires ──────────────────────────
                 print(f"  ✅ {name}: {sig['direction']} | "
-                      f"score {sig['score']}/3 | regime {regime}")
+                      f"entry={sig['entry']} | score={sig['score']}/3")
 
                 msg = format_signal(name, sig, freq, regime, session_note)
                 send_telegram(msg)
@@ -688,8 +742,7 @@ async def run_bot():
                 state["last_signal_time"] = now_ts
                 state["total_signals"] += 1
                 state["daily_signals"] += 1
-                direction_key = sig["direction"].lower()  # 'buy' or 'sell'
-                if direction_key == "buy":
+                if sig["direction"] == "BUY":
                     state["daily_buy"] += 1
                 else:
                     state["daily_sell"] += 1
