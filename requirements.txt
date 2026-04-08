@@ -1,0 +1,9 @@
+
+
+# requirements.txt
+
+pandas
+numpy
+pandas-ta
+requests
+websockets
