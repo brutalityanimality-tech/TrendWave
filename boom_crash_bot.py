@@ -9,9 +9,14 @@
   ADAPTIVE UPGRADES:
     1. Volatility Regime Filter  — pauses in chaotic markets
     2. ADX Trend Strength Filter — skips choppy/sideways markets
-    3. Session Quality Filter    — avoids low-quality time windows
-    4. Loss Memory / Auto-Pause  — pauses market after 3 losses
-    5. Dynamic ATR Multiplier    — widens/tightens SL & TP with volatility
+       (threshold lowered to 15 — synthetics trend at lower ADX)
+    3. Loss Memory / Auto-Pause  — pauses market after 3 losses
+    4. Dynamic ATR Multiplier    — widens/tightens SL & TP with volatility
+
+  NOTE: Session filter removed — Boom/Crash are 24/7 synthetics,
+  not Forex. There is no off-peak for these markets.
+  BB squeeze relaxed to 35th percentile (was 20th).
+  30M bias no longer requires MACD — EMA stack + RSI is enough.
 
   DATA SOURCE:
     Live data via official Deriv WebSocket API (derivws.com)
@@ -44,8 +49,6 @@ import numpy as np
 import pandas as pd
 import pandas_ta as ta
 from datetime import datetime, timezone
-
-
 
 
 # ─────────────────────────────────────────────────────────────
@@ -102,9 +105,11 @@ BASE_SETTINGS = {
 # ─────────────────────────────────────────────────────────────
 ATR_REGIME_MIN       = 0.5    # below = dead/flat market
 ATR_REGIME_MAX       = 2.8    # above = chaotic, block signals
-ADX_MIN              = 20     # below = choppy, skip
+ADX_MIN              = 15     # lowered from 20 — synthetics trend at lower ADX
 ADX_MAX              = 60     # above = overextended, warn
-GOOD_SESSIONS        = [(6, 12), (13, 18), (20, 23)]  # UTC hours
+# SESSION FILTER REMOVED — Boom/Crash are 24/7 synthetic indices.
+# There is no off-peak. All hours are treated equally.
+BB_SQUEEZE_PERCENTILE = 35    # relaxed from 20 — squeeze at 35th percentile
 MAX_CONSECUTIVE_LOSSES = 3
 LOSS_PAUSE_MINUTES   = 120
 DYNAMIC_ATR_HIGH_VOL = 1.3
@@ -331,18 +336,7 @@ def check_adx(df: pd.DataFrame, bias: str) -> tuple[bool, float, str]:
 
 
 # ─────────────────────────────────────────────────────────────
-#  ADAPTIVE FILTER 3 — SESSION QUALITY
-# ─────────────────────────────────────────────────────────────
-def check_session() -> tuple[bool, str]:
-    hour = datetime.now(timezone.utc).hour
-    for start, end in GOOD_SESSIONS:
-        if start <= hour < end:
-            return True, f"Peak session UTC {start:02d}:00–{end:02d}:00 ✅"
-    return False, f"Off-peak UTC {hour:02d}:xx ⚠️"
-
-
-# ─────────────────────────────────────────────────────────────
-#  ADAPTIVE FILTER 4 — LOSS MEMORY
+#  ADAPTIVE FILTER 3 — LOSS MEMORY
 # ─────────────────────────────────────────────────────────────
 def is_market_paused(name: str) -> tuple[bool, str]:
     s   = market_state[name]
@@ -375,15 +369,17 @@ def record_win(name: str):
 
 # ─────────────────────────────────────────────────────────────
 #  LAYER 1 — 30M BIAS
+#  MACD removed from bias check — EMA stack + RSI is sufficient.
+#  Requiring MACD as well was too strict and blocked valid trends.
 # ─────────────────────────────────────────────────────────────
 def check_bias(df30: pd.DataFrame) -> str | None:
     df30 = add_indicators(df30)
     r    = df30.iloc[-1]
     p    = r["close"]
     bull = (p > r["ema20"] > r["ema50"] > r["ema100"] > r["ema200"]
-            and r["rsi"] > 50 and r["macd"] > 0)
+            and r["rsi"] > 50)
     bear = (p < r["ema20"] < r["ema50"] < r["ema100"] < r["ema200"]
-            and r["rsi"] < 50 and r["macd"] < 0)
+            and r["rsi"] < 50)
     return "BUY" if bull else ("SELL" if bear else None)
 
 
@@ -397,8 +393,9 @@ def check_entry(df5: pd.DataFrame, bias: str,
     cfg  = BASE_SETTINGS[freq]
 
     # Layer 2 — BB squeeze + ATR compression
+    # BB_SQUEEZE_PERCENTILE relaxed to 35 (was 20) — easier to trigger
     recent_bw  = df5["bb_width"].dropna().tail(50)
-    bb_squeeze = last["bb_width"] <= np.percentile(recent_bw, 20)
+    bb_squeeze = last["bb_width"] <= np.percentile(recent_bw, BB_SQUEEZE_PERCENTILE)
     atr_low    = last["atr"] < last["atr_ma"]
     if not (bb_squeeze and atr_low):
         return None
@@ -462,8 +459,7 @@ REGIME_LABELS = {
     "CHAOTIC" : "🔴 Chaotic",
 }
 
-def format_signal(name: str, sig: dict, freq: int,
-                  regime: str, session_note: str) -> str:
+def format_signal(name: str, sig: dict, freq: int, regime: str) -> str:
     cfg    = BASE_SETTINGS[freq]
     rr     = round((cfg["atr_tp"] * sig["dyn_mult"]) /
                    (cfg["atr_sl"] * sig["dyn_mult"]), 1)
@@ -496,7 +492,6 @@ def format_signal(name: str, sig: dict, freq: int,
         f"ADX    {sig['adx']}\n\n"
         f"┄┄┄┄ Market Conditions ┄┄┄┄\n"
         f"Regime   {REGIME_LABELS.get(regime, regime)}\n"
-        f"Session  {session_note}\n"
         f"{dyn_note}\n\n"
         f"Confluence  {stars} ({sig['score']}/3)\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -527,8 +522,8 @@ def format_summary() -> str:
         "━━━━━━━━━━━━━━━━━━━━━━━",
         "💡 <b>Tomorrow tips:</b>",
         "• Only act on 3/3 confluence signals",
-        "• Skip off-peak session signals",
         "• Trust the auto-pause",
+        "• Bot scans 24/7 — all hours are valid",
         "<i>Stats reset for new day.</i>",
     ]
     return "\n".join(lines)
@@ -634,19 +629,18 @@ def get_block_emoji(reason: str) -> str:
 
 def format_diagnostic() -> str:
     now  = datetime.now(timezone.utc).strftime("%H:%M UTC")
-    _, session_note = check_session()
     lines = [
         f"🔬 <b>Diagnostic Report — {now}</b>",
         f"━━━━━━━━━━━━━━━━━━━━━━━",
-        f"Session: {session_note}\n",
+        f"🕐 Scanning 24/7 — no off-peak hours\n",
     ]
 
     any_close = False
     for name, s in market_state.items():
-        reason = s.get("last_block_reason", "Not yet scanned")
+        reason        = s.get("last_block_reason", "Not yet scanned")
         blocked_count = s.get("scans_blocked", 0)
-        emoji  = get_block_emoji(reason)
-        regime = REGIME_LABELS.get(s.get("regime", "NORMAL"), "Normal")
+        emoji         = get_block_emoji(reason)
+        regime        = REGIME_LABELS.get(s.get("regime", "NORMAL"), "Normal")
 
         # Flag markets that are "close" to signalling
         close_flag = ""
@@ -671,12 +665,13 @@ def format_diagnostic() -> str:
         "\n<b>What each block means:</b>\n"
         "⏱ Cooldown — recent signal fired, waiting 30m\n"
         "⏸ Paused — 3 losses hit, auto-protecting account\n"
-        "🌪 Chaotic — market too volatile, unsafe to trade\n"
-        "📉 No 30M Bias — EMAs not clearly stacked\n"
-        "📏 ADX — trend too weak or wrong direction\n"
-        "🔲 No Compression — BB/ATR not squeezing yet\n"
+        "🌪 Chaotic — ATR too high, market unsafe\n"
+        "📉 No 30M Bias — EMAs not stacked (EMA + RSI check)\n"
+        "📏 ADX — trend strength below 15 or wrong direction\n"
+        "🔲 No Compression — BB/ATR not squeezing (35th pct)\n"
         "🎯 Entry Timing — RSI/MACD/Stoch not aligned\n"
-        "⭐ Low Score — not enough indicators agree"
+        "⭐ Low Score — less than 2/3 indicators agree\n"
+        "🔄 Not yet scanned — bot just started, first scan pending"
     )
     return "\n".join(lines)
 
@@ -696,16 +691,20 @@ async def run_bot():
     last_diagnostic = 0
 
     send_telegram(
-        "🤖 <b>Boom &amp; Crash Signal Bot — ADAPTIVE EDITION</b>\n\n"
+        "🤖 <b>Boom &amp; Crash Signal Bot — ADAPTIVE EDITION v2</b>\n\n"
         "📈 Boom 300 | Boom 500 | Boom 1000\n"
         "📉 Crash 300 | Crash 500 | Crash 1000\n\n"
         "🔌 Connected via: <code>wss://derivws.com</code>\n\n"
-        "🧠 <b>Smart Filters Active:</b>\n"
+        "🧠 <b>Active Filters:</b>\n"
         "  • Volatility Regime Detection\n"
-        "  • ADX Trend Strength Check\n"
-        "  • Session Quality Filter\n"
+        "  • ADX Trend Strength (min 15)\n"
         "  • Loss Memory Auto-Pause\n"
         "  • Dynamic SL/TP Adjustment\n\n"
+        "✅ <b>Relaxed for more signals:</b>\n"
+        "  • Session filter removed — scanning 24/7\n"
+        "  • BB squeeze at 35th percentile (was 20th)\n"
+        "  • 30M bias: EMA stack + RSI only (no MACD)\n"
+        "  • Min confluence: 2/3 always\n\n"
         "📲 <b>Commands:</b>\n"
         "  /win Crash 1000  — record a win\n"
         "  /loss Boom 500   — record a loss\n"
@@ -806,13 +805,12 @@ async def run_bot():
                     state["scans_blocked"]    += 1
                     continue
 
-                # ── Filter 4: Session Quality ─────────────
-                good_session, session_note = check_session()
-                min_score = 2 if good_session else 3
+                # Session filter removed — Boom/Crash are 24/7 synthetics.
+                # All hours treated equally. min_score always 2/3.
+                min_score = 2
 
                 print(f"  {name}: bias={bias} | price={live_price} | "
-                      f"regime={regime} | ADX={adx_val:.1f} | "
-                      f"session={'peak' if good_session else 'off-peak'}")
+                      f"regime={regime} | ADX={adx_val:.1f}")
 
                 # ── Layers 2+3: Entry signal ──────────────
                 sig = check_entry(df5_ind, bias, freq, dyn_mult)
@@ -830,8 +828,7 @@ async def run_bot():
                           f"{min_score} required ({'off-peak' if not good_session else 'standard'})")
                     state["last_block_reason"] = (
                         f"Low Score — {sig['score']}/{min_score} indicators agree "
-                        f"(RSI={sig['rsi']}, Stoch={sig['stoch_k']}, "
-                        f"{'off-peak needs 3/3' if not good_session else 'needs 2/3'})"
+                        f"(RSI={sig['rsi']}, Stoch={sig['stoch_k']}, needs 2/3)"
                     )
                     state["scans_blocked"]    += 1
                     continue
@@ -840,7 +837,7 @@ async def run_bot():
                 print(f"  ✅ {name}: {sig['direction']} | "
                       f"entry={sig['entry']} | score={sig['score']}/3")
 
-                msg = format_signal(name, sig, freq, regime, session_note)
+                msg = format_signal(name, sig, freq, regime)
                 send_telegram(msg)
 
                 # Update state
