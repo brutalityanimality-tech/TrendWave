@@ -7,3 +7,4 @@ numpy
 pandas-ta
 requests
 websockets
+python-dotenv

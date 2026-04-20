@@ -34,3 +34,7 @@ dist/
 *.sqlite3
 *.db
 *.env
+
+# Ignore files
+
+COMMIT*

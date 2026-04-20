@@ -1,5 +1,3 @@
-
-
 """
 =============================================================
   BOOM & CRASH SIGNAL BOT  —  ADAPTIVE EDITION
@@ -30,6 +28,8 @@
 SETUP
 -----
 pip install pandas numpy pandas-ta requests websockets python-dotenv
+Rename .env.example → .env and fill in your values.
+Run: python boom_crash_bot.py
 
 TELEGRAM COMMANDS (send in your Telegram chat):
   /win Crash 1000   — record a win, resets loss streak
@@ -48,7 +48,9 @@ import numpy as np
 import pandas as pd
 import pandas_ta as ta
 from datetime import datetime, timezone
+from dotenv import load_dotenv
 
+load_dotenv()
 
 # ─────────────────────────────────────────────────────────────
 #  CONFIG
@@ -62,13 +64,44 @@ COOLDOWN = 1800   # 30 min between signals per market
 DIAGNOSTIC_EVERY = 1800   # send diagnostic report every 30 minutes
 
 # ─────────────────────────────────────────────────────────────
-#  DERIV WEBSOCKET URL  (corrected from user-supplied snippet)
-#  Format: wss://derivws.com/websockets/v3?app_id=YOUR_APP_ID
+#  DERIV WEBSOCKET ENDPOINTS
+#  Primary:  wss://ws.derivws.com  (official current endpoint)
+#  Fallback: wss://ws.binaryws.com (older but still active)
+#
+#  App ID: get your own free one at https://app.deriv.com/account/api-token
+#  The default 1089 may be rate-limited — set your own in .env
 # ─────────────────────────────────────────────────────────────
+WS_ENDPOINTS = [
+    "wss://ws.derivws.com/websockets/v3",
+    "wss://ws.binaryws.com/websockets/v3",
+]
+active_endpoint_idx = 0   # starts on primary, falls back automatically
 
 
-def deriv_ws_url(app_id: str) -> str:
-    return f"wss://derivws.com/websockets/v3?app_id={app_id}"
+def deriv_ws_url() -> str:
+    """Return current active WebSocket endpoint with app_id."""
+    return f"{WS_ENDPOINTS[active_endpoint_idx]}?app_id={DERIV_APP_ID}"
+
+
+async def get_working_endpoint() -> str | None:
+    """
+    Try each endpoint in order, return the first one that responds.
+    Called on startup and after repeated failures.
+    """
+    global active_endpoint_idx
+    for i, ep in enumerate(WS_ENDPOINTS):
+        url = f"{ep}?app_id={DERIV_APP_ID}"
+        try:
+            async with websockets.connect(url, open_timeout=8) as ws:
+                await ws.send(json.dumps({"ping": 1}))
+                resp = json.loads(await asyncio.wait_for(ws.recv(), timeout=8))
+                if resp.get("msg_type") == "ping" or "pong" in resp:
+                    active_endpoint_idx = i
+                    print(f"  ✅ Working endpoint: {ep}")
+                    return url
+        except Exception as e:
+            print(f"  ❌ Endpoint {ep} failed: {e}")
+    return None
 
 
 # ─────────────────────────────────────────────────────────────
@@ -157,57 +190,39 @@ def send_telegram(message: str):
 
 
 # ─────────────────────────────────────────────────────────────
-#  LIVE TICK STREAM  (from user-supplied pattern)
-#  Used to get the latest real-time price for a symbol.
+#  LIVE TICK — get latest price for a symbol
 # ─────────────────────────────────────────────────────────────
 async def get_latest_tick(symbol: str) -> float | None:
-    """
-    Connect to Deriv WebSocket, subscribe to live ticks,
-    grab the first tick price, then disconnect.
-    Returns the latest quoted price or None on error.
-    """
-    uri = deriv_ws_url(DERIV_APP_ID)
-    request = {
-        "ticks": symbol,
-        "subscribe": 1,
-    }
+    uri = deriv_ws_url()
+    request = {"ticks": symbol, "subscribe": 1}
     try:
-        async with websockets.connect(uri) as websocket:
-            await websocket.send(json.dumps(request))
-            # Wait for first tick response
+        async with websockets.connect(uri, open_timeout=10) as ws:
+            await ws.send(json.dumps(request))
             while True:
-                response = await asyncio.wait_for(websocket.recv(), timeout=10)
+                response = await asyncio.wait_for(ws.recv(), timeout=12)
                 data = json.loads(response)
-
                 if data.get("msg_type") == "tick":
-                    tick = data["tick"]
-                    print(f"  Live tick — {tick['symbol']}: {tick['quote']}")
-                    return float(tick["quote"])
-
+                    price = float(data["tick"]["quote"])
+                    print(f"  Tick {symbol}: {price}")
+                    return price
                 elif "error" in data:
-                    print(
-                        f"  Tick error for {symbol}: {data['error']['message']}")
+                    msg = data["error"]["message"]
+                    print(f"  Tick API error {symbol}: {msg}")
                     return None
-
     except asyncio.TimeoutError:
-        print(f"  Tick timeout for {symbol}")
+        print(f"  Tick timeout {symbol}")
         return None
     except Exception as e:
-        print(f"  Tick stream error for {symbol}: {e}")
+        print(f"  Tick exception {symbol}: {e}")
         return None
 
 
 # ─────────────────────────────────────────────────────────────
 #  CANDLE HISTORY FETCHER
-#  Used to pull OHLCV history for indicator calculations.
 # ─────────────────────────────────────────────────────────────
 async def fetch_candles(symbol: str, granularity: int, count: int) -> pd.DataFrame:
-    """
-    Fetch historical OHLCV candles via Deriv WebSocket.
-    granularity: 300  = 5  minute candles
-                 1800 = 30 minute candles
-    """
-    uri = deriv_ws_url(DERIV_APP_ID)
+    """granularity: 300 = 5M candles, 1800 = 30M candles"""
+    uri = deriv_ws_url()
     request = {
         "ticks_history": symbol,
         "adjust_start_time": 1,
@@ -217,14 +232,11 @@ async def fetch_candles(symbol: str, granularity: int, count: int) -> pd.DataFra
         "style": "candles",
     }
     try:
-        async with websockets.connect(uri) as ws:
+        async with websockets.connect(uri, open_timeout=10) as ws:
             await ws.send(json.dumps(request))
-
-            # Keep reading until we get candles or an error
             while True:
                 response = await asyncio.wait_for(ws.recv(), timeout=15)
                 data = json.loads(response)
-
                 if "candles" in data:
                     df = pd.DataFrame(data["candles"])
                     df.rename(columns={"epoch": "time"}, inplace=True)
@@ -232,17 +244,15 @@ async def fetch_candles(symbol: str, granularity: int, count: int) -> pd.DataFra
                     for col in ["open", "high", "low", "close"]:
                         df[col] = df[col].astype(float)
                     return df.reset_index(drop=True)
-
                 elif "error" in data:
-                    print(f"  Candle error {symbol} ({granularity}s): "
-                          f"{data['error']['message']}")
+                    print(
+                        f"  Candle error {symbol}: {data['error']['message']}")
                     return pd.DataFrame()
-
     except asyncio.TimeoutError:
         print(f"  Candle timeout {symbol} ({granularity}s)")
         return pd.DataFrame()
     except Exception as e:
-        print(f"  Candle fetch error {symbol}: {e}")
+        print(f"  Candle exception {symbol}: {e}")
         return pd.DataFrame()
 
 
@@ -693,44 +703,51 @@ def format_diagnostic() -> str:
 # ─────────────────────────────────────────────────────────────
 async def test_connection() -> bool:
     """
-    Test WebSocket connection and a single tick fetch.
-    Sends a Telegram message with the result.
+    Try all endpoints, report which one works via Telegram.
+    Sets active_endpoint_idx to the working one.
     """
-    test_symbol = "R_100"   # Volatility 100 — always available
-    uri = deriv_ws_url(DERIV_APP_ID)
-    try:
-        async with websockets.connect(uri, open_timeout=10) as ws:
-            await ws.send(json.dumps({"ticks": test_symbol, "subscribe": 1}))
-            resp = json.loads(
-                await asyncio.wait_for(ws.recv(), timeout=10)
-            )
-        if resp.get("msg_type") == "tick":
-            price = resp["tick"]["quote"]
+    send_telegram(
+        "🔌 <b>Testing Deriv WebSocket endpoints...</b>\n"
+        f"Primary:  <code>{WS_ENDPOINTS[0]}</code>\n"
+        f"Fallback: <code>{WS_ENDPOINTS[1]}</code>\n"
+        f"App ID:   <code>{DERIV_APP_ID}</code>"
+    )
+    working = await get_working_endpoint()
+    if working:
+        # Test a real tick on Crash 500
+        test_price = await get_latest_tick("R_500")
+        if test_price:
             send_telegram(
-                f"🔌 <b>Connection Test — PASSED ✅</b>\n\n"
-                f"WebSocket: <code>wss://derivws.com</code>\n"
-                f"Test tick (V100): <code>{price}</code>\n\n"
-                f"Bot is live and will begin scanning in "
-                f"{CHECK_INTERVAL // 60} minutes."
+                f"✅ <b>Connection Test — PASSED</b>\n\n"
+                f"Endpoint: <code>{WS_ENDPOINTS[active_endpoint_idx]}</code>\n"
+                f"Test tick (Crash 500): <code>{test_price}</code>\n\n"
+                f"Bot is live. First scan in {CHECK_INTERVAL // 60} minutes."
             )
             return True
         else:
-            err = resp.get("error", {}).get("message", "Unknown response")
             send_telegram(
-                f"🔌 <b>Connection Test — FAILED ❌</b>\n\n"
-                f"Response: {err}\n\n"
-                f"<i>Check your DERIV_APP_ID in .env</i>"
+                "⚠️ <b>Endpoint reachable but tick request failed.</b>\n\n"
+                "Possible cause: App ID rejected or symbol not available.\n"
+                f"App ID in use: <code>{DERIV_APP_ID}</code>\n\n"
+                "👉 Get your own free App ID at:\n"
+                "<code>app.deriv.com → API Token → Create App</code>\n"
+                "Then update DERIV_APP_ID in your .env file."
             )
             return False
-    except Exception as e:
+    else:
         send_telegram(
-            f"🔌 <b>Connection Test — ERROR ❌</b>\n\n"
-            f"<code>{str(e)}</code>\n\n"
-            f"Possible causes:\n"
-            f"• Wrong WebSocket URL\n"
-            f"• Server has no internet access\n"
-            f"• Deriv API is down\n\n"
-            f"<i>Bot will keep retrying every 5 minutes.</i>"
+            "❌ <b>Connection Test — ALL ENDPOINTS FAILED</b>\n\n"
+            f"Tried:\n"
+            f"• <code>{WS_ENDPOINTS[0]}</code>\n"
+            f"• <code>{WS_ENDPOINTS[1]}</code>\n\n"
+            "<b>Action required — check one of these:</b>\n"
+            "1. Does your server have internet access?\n"
+            "   Run: <code>ping google.com</code>\n\n"
+            "2. Is port 443 (WSS) open on your server?\n"
+            "   Run: <code>curl https://ws.derivws.com</code>\n\n"
+            "3. Get your own App ID free at:\n"
+            "   <code>app.deriv.com → API Token → Create App</code>\n\n"
+            "Bot will keep retrying every 5 minutes."
         )
         return False
 
@@ -959,16 +976,32 @@ async def run_bot():
                 scan_errors.append(err_msg)
 
         # ── Post-scan error report ────────────────────────
-        # If every market hit an error this cycle, alert immediately
+        # If every market hit an error, alert and try switching endpoint
         if scan_errors and scanned_count > 0 and len(scan_errors) == scanned_count:
             err_summary = "\n".join(f"• {e}" for e in scan_errors[:6])
             send_telegram(
                 f"🚨 <b>Scan Error Alert — {scan_time}</b>\n\n"
                 f"All markets failed this cycle:\n{err_summary}\n\n"
-                f"<i>Possible causes: Deriv API down, bad App ID, "
-                f"no internet on server.</i>\n"
+                f"🔄 Trying to switch WebSocket endpoint...\n"
                 f"Bot will retry in {CHECK_INTERVAL // 60} minutes."
             )
+            # Try to find a working endpoint automatically
+            working = await get_working_endpoint()
+            if working:
+                send_telegram(
+                    f"✅ <b>Endpoint switched successfully!</b>\n"
+                    f"Now using: <code>{WS_ENDPOINTS[active_endpoint_idx]}</code>\n"
+                    f"Next scan will retry in {CHECK_INTERVAL // 60} minutes."
+                )
+            else:
+                send_telegram(
+                    "❌ <b>All endpoints still failing.</b>\n\n"
+                    "<b>Please check:</b>\n"
+                    "1. Your server internet connection\n"
+                    "2. Your App ID in .env file\n"
+                    "   Get one free: <code>app.deriv.com</code>\n"
+                    "3. Run on server: <code>curl https://ws.derivws.com</code>"
+                )
 
         first_scan_done = True
         print(f"  Next scan in {CHECK_INTERVAL // 60} min.")
